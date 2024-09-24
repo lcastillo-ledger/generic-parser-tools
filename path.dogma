@@ -1,0 +1,72 @@
+dogma_v1 utf-8
+- identifier  = binary_path
+- description = Generic Parser Binary Paths
+- charsets    = utf-8
+- dogma       = https://github.com/kstenerud/dogma/blob/master/v1/dogma_v1.md
+
+path                            = tlv(TAG_BINARY_PATH, binary_path);
+
+binary_path                     = path_elements * 
+                                & path_leaf
+                                & path_slice ?
+                                ;
+
+path_elements                   = tuple_element 
+                                | array_element;
+
+tuple_element                   = tlv(TAG_TUPLE_ELEMENT, slot_offset);
+
+slot_offset                     = u16(~);
+
+array_element                   = tlv(TAG_ARRAY_ELEMENT, item_offset, item_size);
+
+item_offset                     = i16(~);
+item_size                       = u16(~);
+
+ref_element                     = zero_length_tlv(TAG_REF_ELEMENT);
+
+path_leaf                       = tlv(TAG_LEAF_ELEMENT, leaf_type);
+
+leaf_type                       = u8
+                                (   STATIC_LEAF         # The path points to a static value, directly encoded in targeted slot
+                                |   DYNAMIC_LEAF        # The path points to a dynamic value, the targeted slot contains the length of the target data in bytes, followed by the data itself (in 32 bytes chunks)
+                                |   ARRAY_LEAF          # The path points to an array, the targeted slot contains the length of the array, in number of elements, followed by the array pointers 
+                                |   TUPLE_LEAF          # The path points to a tuple, the targeted slot contains the first item of the tuple 
+                                ); # leaf type
+
+path_slice                      = tlv(TAG_SLICE_ELEMENT, slice_beg & slice_end);
+
+slice_beg                       = u16(~);
+slice_end                       = u16(~);
+
+# TODO: Fill with real tag values
+TAG_BINARY_PATH                 = 0x01;
+TAG_TUPLE_ELEMENT               = 0x02;
+TAG_ARRAY_ELEMENT               = 0x03;
+TAG_REF_ELEMENT                 = 0x04;
+TAG_LEAF_ELEMENT                = 0x05;
+TAG_SLICE_ELEMENT               = 0x06;
+
+# Common definitions
+tlv(tag, value)                 = der_encoding(tag) & der_encoding(var(length, ~)) & sized(8*length, value)
+
+zero_length_tlv(tag)           = der_encoding(tag) & ZERO_LENGTH);
+ZERO_LENGTH                     = u8(0x00);
+
+der_encoding(value)             = 
+                                [
+                                    value < 0x80    : u8(value);
+                                    value <= 0xFF   : 0x81 & u8(value);
+                                    value <= 0xFFFF : 0x82 & u16(value);
+                                                    : 0b1 & uint(7, var(value_length, ~)) & sized(8*value_length, value); # Not used for Nano
+                                ];
+
+semver(major,minor,patch)               = u8(major) & u8(minor) & byte_order(msb, u16(patch));
+
+displayable_character                   = u8(~); # utf-8 encoded string, restrict characters?
+
+u8(values)                              = uint(8,values);
+u16(values)                             = ordered(uint(16,values));
+u32(values)                             = ordered(uint(32,values));
+
+i16(values)                             = ordered(sint(16,values));
