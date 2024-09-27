@@ -2,6 +2,12 @@ import json
 from typing import List, Tuple, Union
 from enum import Enum
 
+ESC = chr(27)
+BOLD = ESC + "[1m"
+BOLD_RED = ESC + "[31;1m"
+ITALIC = ESC + "[3m"
+NORMAL = ESC + "[0m"
+
 # ABI element class and parsing functions
 
 class ABIElement:
@@ -237,11 +243,7 @@ class PathElement:
             length=4
             value = f"{self.start:04x}{self.end:04x}"
         
-        ESC = chr(27)
-        BOLD = ESC + "[31;1m"
-        ITALIC = ESC + "[3m"
-        NORMAL = ESC + "[0m"
-        tag_str = BOLD + f"{tag:02x}" + NORMAL
+        tag_str = BOLD_RED + f"{tag:02x}" + NORMAL
         length_str = ITALIC + f"{length:02x}" + NORMAL
 
         return f"{tag_str} {length_str} {value} " if value else f"{tag_str} {length_str} "
@@ -387,6 +389,7 @@ def build_path(path: str, root_function: ABIElement) -> Path:
     return Path(path_elements)
 
 def apply_path(binary_path: Path, input_data: bytes) -> bytes:
+
     offset = 0
     ref_offset = 0
 
@@ -394,27 +397,30 @@ def apply_path(binary_path: Path, input_data: bytes) -> bytes:
     slice = path.pop() if path[-1].type == PathElementType.SLICE_ELEMENT else None
 
     for element in path:
+
         if element.type == PathElementType.TUPLE_ELEMENT:
             ref_offset = offset
             offset += element.index * 32
-            # print(f"TupleElement: ref_offset={ref_offset / 32} offset={offset / 32}")
+
         elif element.type == PathElementType.ARRAY_ELEMENT:
             ref_offset = offset
             array_length = int.from_bytes(input_data[offset:offset + 32], byteorder='big')
-            if element.index >= array_length:
+
+            if element.index >= array_length or element.index < -array_length:
                 raise IndexError(f"Array index {element.index} out of bounds")
             if element.index < 0:
                 offset += 32 + (array_length + element.index) * element.items_weight * 32
             else:
                 offset += 32 + element.index * element.items_weight * 32
-            # print(f"ArrayElement: array_length={array_length} ref_offset={ref_offset / 32} offset={offset / 32}")
+
         elif element.type == PathElementType.REF_ELEMENT:
             offset = ref_offset + int.from_bytes(input_data[offset:offset + 32], byteorder='big')
-            # print(f"RefElement: ref_offset={ref_offset} offset={offset}")
+
         elif element.type == PathElementType.LEAF_ELEMENT:
-            # print(f"LeafElement: offset={offset}")
+
             if element.leaf_type == PathLeafType.STATIC_LEAF:
                 return input_data[offset:offset + 32]
+            
             elif element.leaf_type == PathLeafType.DYNAMIC_LEAF:
                 length = int.from_bytes(input_data[offset:offset + 32], byteorder='big')
                 if slice:
@@ -426,8 +432,113 @@ def apply_path(binary_path: Path, input_data: bytes) -> bytes:
                     
                     return input_data[offset + 32 + start:offset + 32 + end]
                 return input_data[offset + 32:offset + 32 + length]
+            
     #raise ValueError("Path did not resolve to a leaf element")
     pass
+
+
+
+# Fill_values fills the path and values of a chunked input data based on the abi_element passed.
+# Current_index is the start of the encoding of the current abi_element in the input data.
+# Current_path is the path to the current abi_element in the function top-level abi.
+def fill_values(abi_element: ABIElement, chunks: List[str], paths: List[str], values: List[str], current_index: int, current_path: str) -> int:
+    
+    if abi_element.is_struct():
+        index_in_current_encoding = 0
+        for comp in abi_element.components:
+            target_path = (current_path + "." if current_path else "") + comp.name
+        
+            if comp.is_dynamic():
+                # current encoding is one index value to the dynamic data located after in the input data)
+                encoding_location = current_index + int(chunks[current_index + index_in_current_encoding],16) // 32
+                
+                paths[current_index + index_in_current_encoding] = f"ref to {target_path}"
+                values[current_index + index_in_current_encoding ] = f"idx {encoding_location}"
+                
+            else:
+                # a static struct is encoded in place
+                encoding_location = current_index + index_in_current_encoding
+
+            filled = fill_values(comp, chunks, paths, values, encoding_location, target_path)
+            index_in_current_encoding += filled if not comp.is_dynamic() else 1
+        return index_in_current_encoding
+    
+    if abi_element.is_array():
+
+        if abi_element.dimension == 0:
+            
+            # dynamic array
+            # current encoding is array length
+            array_length = int(chunks[current_index],16)
+            paths[current_index] = f"{current_path}.[]"
+            values[current_index] = f"length {array_length}"
+        else:
+            array_length  = abi_element.dimension
+        
+        next_element = abi_element.nextInArray()
+        index_with_offset = current_index + (1 if abi_element.dimension == 0 else 0)
+
+        for index in range(0, array_length):
+
+            target_path = current_path + f".[{index}]"
+
+            if next_element.is_dynamic():
+                # current encoding is one index value to the dynamic data located after in the input data
+                encoding_location = current_index + int(chunks[index_with_offset + index],16) // 32
+                paths[index_with_offset + index] = f"ref to {target_path}"
+                values[index_with_offset + index] = f"idx {encoding_location}"
+
+                filled = fill_values(next_element, chunks, paths, values, encoding_location, target_path)
+            else:
+                # a static array is encoded in place
+                encoding_location = index_with_offset + index * next_element.encoding_weight()
+                
+                filled = fill_values(next_element, chunks, paths, values, encoding_location, target_path)
+        return array_length + (1 if abi_element.dimension == 0 else 0) 
+    
+    # not an array or struct is a primitive type
+    if abi_element.is_dynamic():
+        # current encoding index points to the length of the dynamic data in bytes
+        dynamic_length = int(chunks[current_index],16)
+        print(f"Dynamic length: {dynamic_length}")
+        paths[current_index] = f"{current_path}"
+        values[current_index] = f"length {dynamic_length}"
+        total_slots = dynamic_length // 32 + 1
+        for i in range(1,total_slots+1):
+            paths[current_index + i] = current_path + ".{" + f"{i}" +"}"
+            if i == total_slots:
+                value = chunks[current_index + i][:dynamic_length % 32 * 2]
+                print(f"Value: {value}")
+            else:  
+                value = chunks[current_index + i]
+            if abi_element.type == "string":
+                values[current_index + i] = bytes.fromhex(value).decode('utf-8')
+            elif abi_element.type == "bytes":
+                values[current_index + i] = bytes.fromhex(value)
+            else:
+                values[current_index + i] = chunks[current_index + i]
+        return total_slots
+    else:
+        paths[current_index] = current_path
+        if abi_element.type == "bool":
+            values[current_index] = bool(int(chunks[current_index], 16))
+        else:
+            values[current_index] = hex(int(chunks[current_index], 16))
+        return 1
+
+def display_chunks_and_paths(function_abi: ABIElement, chunks: List[str]):
+
+    paths = [""] * len(chunks)
+    values = [""] * len(chunks)
+    
+    fill_values(function_abi, chunks, paths, values, 0 , "")
+
+    print(BOLD + '-' * 80 + NORMAL)
+    print(BOLD + f"Chunks\n" + NORMAL)
+    print(BOLD + f"Idx | Chunk {' ' * 58} | path                 | value" + NORMAL)
+    for i, chunk in enumerate(chunks):
+        print(f"{i:3} | {chunk} | {paths[i].ljust(20)} | {str(values[i]).ljust(20)}")
+    return
 
 test_cases = [ 
     {
@@ -466,24 +577,36 @@ for test in test_cases:
 
     abi = parse_json(json_data)
 
-    print(f"ABI {test['abi_file']}:")
+    print(BOLD + '-' * 80 + NORMAL)
+    print(BOLD + f"ABI {test['abi_file']}:\n" + NORMAL)
     for function in abi:
         print(function)
 
     for function in test['functions']:
 
+        print(BOLD + '-' * 80 + NORMAL)
+        print(BOLD + f"Function: {function['name']}\n" + NORMAL)
+        
         with open(function['input_file'], 'r') as file:
             input_data = file.read()
 
         if input_data.startswith("0x"):
+            selector = input_data[:10]
             input_data = input_data[10:]
         input_data_bytes = bytes.fromhex(input_data)
 
-
+        print(f"Selector: {selector}")
+        chunks = [input_data[i:i+64] for i in range(0, len(input_data)-1, 64)]
+                
         # find function with name "test_static"
         abi_function = next((func for func in abi if func.name == function['name']), None)
+
+        display_chunks_and_paths(abi_function, chunks)
+
         paths = function['paths']
 
+        print(BOLD + '-' * 80 + NORMAL)
+        print(BOLD + f"Paths:\n" + NORMAL)
         for p in paths:
             parsed_path = build_path(p, abi_function)
             print(f"Path {p}:\n\tBinary_repr: {parsed_path.to_string()}\n\tTLV: {parsed_path.to_bytes()}")
